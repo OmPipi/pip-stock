@@ -502,6 +502,125 @@ def ai_analyze_with_model(provider, model, payload, api_keys):
     except Exception as e:
         return None, f"AI wrapper unexpected error: {e}"
 
+def render_ai_result(ai_output, container=None, show_raw_button=True):
+    """
+    Render AI analysis in a friendly snapshot (tables/expanders) instead of raw JSON.
+    - ai_output: dict or string (will attempt to parse JSON)
+    - container: optional streamlit container (e.g., st) to call methods on; default uses st.
+    - show_raw_button: if True, show collapsed raw output for debugging.
+    """
+    ui = container if container is not None else st
+
+    if ai_output is None:
+        ui.write("No AI analysis available.")
+        return
+
+    # if ai_output is string, try parse JSON inside
+    parsed = None
+    if isinstance(ai_output, str):
+        try:
+            parsed = json.loads(ai_output)
+        except Exception:
+            import re
+            m = re.search(r"\{.*\}", ai_output, flags=re.DOTALL)
+            if m:
+                try:
+                    parsed = json.loads(m.group(0))
+                except Exception:
+                    parsed = None
+            else:
+                parsed = None
+    elif isinstance(ai_output, dict):
+        parsed = ai_output
+    else:
+        # unknown type: fallback to str display
+        ui.write("AI output (unrecognized format):")
+        ui.code(str(ai_output)[:1000])
+        return
+
+    if parsed is None:
+        ui.write("AI output could not be parsed as JSON. Showing raw snippet:")
+        ui.code(str(ai_output)[:2000])
+        return
+
+    # Extract expected fields safely
+    rekom = parsed.get("rekomendasi") or parsed.get("recommendation") or parsed.get("recommend") or "-"
+    probabilitas = parsed.get("probabilitas") or parsed.get("probabilities") or {}
+    alasan = parsed.get("alasan") or parsed.get("reason") or parsed.get("explanation") or ""
+    risk_reward = parsed.get("risk_reward") or parsed.get("riskReward") or parsed.get("risk_reward_ratio") or {}
+    catatan = parsed.get("catatan_risiko") or parsed.get("risk_note") or parsed.get("notes") or ""
+
+    # Top-level snapshot (two-column)
+    colA, colB = ui.columns([1,2])
+    with colA:
+        ui.markdown("### Recommendation")
+        ui.metric(label="", value=str(rekom).upper())
+        # Probabilities summary
+        if probabilitas and isinstance(probabilitas, dict):
+            # build table-like list
+            rows = []
+            for k,v in probabilitas.items():
+                try:
+                    pct = float(v)
+                    # if in 0..1 convert to percent
+                    if 0.0 <= pct <= 1.0:
+                        pct = pct * 100
+                except Exception:
+                    try:
+                        pct = float(str(v).strip().strip("%"))
+                    except Exception:
+                        pct = None
+                rows.append({"metric": k, "value": (f"{pct:.1f}%" if pct is not None else str(v))})
+            if rows:
+                ui.markdown("**Probabilities**")
+                ui.table(pd.DataFrame(rows).set_index("metric"))
+
+    with colB:
+        ui.markdown("### Risk & Reward")
+        if risk_reward and isinstance(risk_reward, dict):
+            rr_rows = []
+            for k in ["entry","stoploss","stop","target","rr_ratio","rr"]:
+                if k in risk_reward:
+                    rr_rows.append((k, risk_reward.get(k)))
+            # include any other keys
+            for k,v in risk_reward.items():
+                if k not in [r[0] for r in rr_rows]:
+                    rr_rows.append((k,v))
+            if rr_rows:
+                rr_df = pd.DataFrame(rr_rows, columns=["field","value"]).set_index("field")
+                ui.table(rr_df)
+        else:
+            ui.write("No R/R data provided by AI.")
+
+    # Reasons / explanation
+    if alasan:
+        with ui.expander("AI explanation / reasons", expanded=False):
+            ui.write(alasan)
+
+    # Risk notes
+    if catatan:
+        with ui.expander("Risk notes", expanded=False):
+            ui.write(catatan)
+
+    # Show any other top-level keys in a compact table (excluding those already shown)
+    shown_keys = {"rekomendasi","probabilitas","alasan","risk_reward","catatan_risiko","recommendation","probabilities","reason","riskReward","notes"}
+    other = {k:v for k,v in parsed.items() if k not in shown_keys}
+    if other:
+        with ui.expander("Other AI fields (collapsed)", expanded=False):
+            try:
+                # create simple table
+                rows = []
+                for k,v in other.items():
+                    rows.append({"field": k, "value": (v if not isinstance(v, (dict,list)) else json.dumps(v)[:500])})
+                ui.table(pd.DataFrame(rows).set_index("field"))
+            except Exception:
+                ui.write(other)
+
+    # optionally show raw
+    if show_raw_button:
+        with ui.expander("Raw AI JSON (for debug)", expanded=False):
+            ui.json(parsed)
+
 # ---------------- Telegram send helper ----------------
 def send_telegram_alert(bot_token, chat_id, message):
     try:
@@ -642,7 +761,7 @@ for ticker in tickers:
         else:
             st.subheader("AI analysis")
             try:
-                st.json(ai_result)
+                render_ai_result(ai_result)
             except Exception:
                 st.write("AI output (raw):", str(ai_result)[:1000])
 
