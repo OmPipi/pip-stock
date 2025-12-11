@@ -1,10 +1,26 @@
-streamlit
-yfinance
-pandas
-numpy
-pandas_ta
-plotly
-requests
-beautifulsoup4
-nltk
-vaderSentiment
+streamlit>=1.40.0
+yfinance>=0.2.40
+pandas>=2.2.2
+numpy>=1.26.4
+pandas_ta>=0.3.14b0
+plotly>=5.22.0
+requests>=2.32.3
+beautifulsoup4>=4.12.3
+vaderSentiment>=3.3.2
+lightgbm>=4.3.0
+scikit-learn>=1.5.0
+
+# AI providers
+google-generativeai>=0.7.2
+
+# Groq (Llama)
+groq>=0.9.0
+
+# Mistral API client (official)
+mistralai>=1.2.3
+
+# DeepSeek (via OpenAI-compatible API)
+openai>=1.42.0
+
+# Optional logging helpers
+python-dotenv>=1.0.1
