@@ -220,7 +220,7 @@ with st.sidebar:
     tickers_input = st.multiselect("Tickers (select)", options=issi_stocks, default=["BRPT.JK","ITMG.JK"])
     mode = st.selectbox("Mode", ["Swing Trading", "Intraday"])
     timeframe_select = st.multiselect("Multi-timeframe", ["1D","4H","1H"], default=["1D"])
-    use_news = st.checkbox("Fetch news (Google News)", value=True)
+    use_news = st.checkbox("Fetch news (Google News)", value=False)
 
     st.markdown("---")
     st.header("AI Provider & Model Selection (keys hidden)")
@@ -741,10 +741,23 @@ else:
 
 summary = []
 
+
 for ticker in tickers:
     st.markdown("---")
     st.header(f"{ticker}  — Mode: {mode}")
     per_ticker_result = {"ticker": ticker, "timeframes": {}}
+
+    # Mode-aware parameterization
+    if mode == "Swing Trading":
+        atr_mult_stop = 1.5
+        atr_mult_target = 2.5
+        prob_horizon = 5
+        tf_default = ["1D", "4H"]
+    else:  # Intraday
+        atr_mult_stop = 0.7
+        atr_mult_target = 1.2
+        prob_horizon = 1
+        tf_default = ["1H", "4H"]
 
     # Fetch multi-timeframe datasets (1D, 4H, 1H) if requested
     tf_dfs = {}
@@ -761,11 +774,10 @@ for ticker in tickers:
             append_log(f"Error fetching {ticker} {tf}: {e}")
             tf_dfs[tf] = pd.DataFrame()
 
-
     # === Initialize Risk Manager (per session, or per run) ===
     risk_manager = RiskManager(account_balance=account_balance)
 
-    for tf in (timeframe_select or ["1D"]):
+    for tf in (timeframe_select or tf_default):
         st.subheader(f"Timeframe: {tf}")
         df = tf_dfs.get(tf)
         if df is None or df.empty:
@@ -797,7 +809,7 @@ for ticker in tickers:
         # === Multi-timeframe confluence ===
         mtf_score, mtf_details = analyze_multi_timeframe_confluence(tf_dfs)
 
-        # === Bayesian Probability ===
+        # === Bayesian Probability (mode-aware horizon)
         rsi = float(df.iloc[-1].get("rsi14", 50))
         news_score = news_sent.get("score", 50)
         prob_up, prob_details = calculate_bayesian_probability(
@@ -805,15 +817,17 @@ for ticker in tickers:
             trend_direction=trend_direction,
             rsi=rsi,
             news_score=news_score,
-            regime=trend_regime
+            regime=trend_regime,
+            historical_win_rate=0.55 if mode=="Swing Trading" else 0.5,
+            prior_p_bullish=0.5 if mode=="Swing Trading" else 0.45
         )
 
-        # === Dynamic Position Sizing ===
+        # === Dynamic Position Sizing (mode-aware ATR multipliers)
         last = df.iloc[-1]
         price = float(last["Close"])
         atr = float(last.get("atr14", price * 0.02))
-        stop_loss = price - atr * 1.5
-        target = price + atr * 2.5
+        stop_loss = price - atr * atr_mult_stop
+        target = price + atr * atr_mult_target
         volatility_regime = detect_volatility_regime(atr, df["atr14"].rolling(20).mean().iloc[-1] if "atr14" in df.columns else None, price)
         shares, sizing_details = risk_manager.calculate_position_size(
             entry_price=price,
@@ -838,7 +852,8 @@ for ticker in tickers:
             f"Multi-TF confluence: {mtf_details['direction']} (score={mtf_score})",
             f"Bayesian prob_up: {prob_up:.2f}",
             f"VSA: {vsa['signal']} (strength={vsa['strength']:.2f})",
-            f"Position size: {shares:.2f} shares (risk {sizing_details.get('risk_per_trade',0):,.0f})"
+            f"Position size: {shares:.2f} shares (risk {sizing_details.get('risk_per_trade',0):,.0f})",
+            f"Mode: {mode} | ATR stop x{atr_mult_stop} | Target x{atr_mult_target} | Prob horizon {prob_horizon}d"
         ]
 
         heuristic_score = mtf_score
