@@ -200,40 +200,32 @@ def calculate_bayesian_probability(
     trend_strength: int,
     trend_direction: str,
     rsi: float,
-    news_score: int,
     regime: RegimeType,
     historical_win_rate: float = 0.55,
     prior_p_bullish: float = 0.5
 ) -> Tuple[float, Dict]:
     """
     Bayesian probability calculation for up move.
-    
     Replaces: linear probability formula
-    
     Returns: (probability_up, details_dict)
     """
     
-    # ========== Likelihood: P(signal | bullish) ==========
+    # ========== Likelihood: P(signal | bullish) ========== 
     p_signal_given_bullish = _calculate_likelihood(
         trend_strength, trend_direction, rsi, regime
     )
     
-    # ========== Opposite likelihood: P(signal | bearish) ==========
+    # ========== Opposite likelihood: P(signal | bearish) ========== 
     p_signal_given_bearish = 1.0 - p_signal_given_bullish
     
-    # ========== Bayes theorem ==========
+    # ========== Bayes theorem ========== 
     likelihood_ratio = (p_signal_given_bullish + 1e-9) / (p_signal_given_bearish + 1e-9)
     
     posterior = (likelihood_ratio * prior_p_bullish) / (
         likelihood_ratio * prior_p_bullish + (1 - prior_p_bullish) + 1e-9
     )
     
-    # ========== News sentiment adjustment (bounded) ==========
-    news_deviation = (news_score - 50) / 100  # -0.5 to +0.5
-    news_factor = 1.0 + np.clip(news_deviation * 0.2, -0.15, 0.15)
-    
-    adjusted_prob = posterior * news_factor
-    adjusted_prob = np.clip(adjusted_prob, 0.1, 0.9)  # Bounds
+    adjusted_prob = np.clip(posterior, 0.1, 0.9)  # Bounds
     
     return adjusted_prob, {
         'p_signal_given_bullish': p_signal_given_bullish,
@@ -241,7 +233,6 @@ def calculate_bayesian_probability(
         'likelihood_ratio': likelihood_ratio,
         'prior_p_bullish': prior_p_bullish,
         'posterior': posterior,
-        'news_factor': news_factor,
         'final_probability': adjusted_prob,
         'historical_win_rate': historical_win_rate
     }

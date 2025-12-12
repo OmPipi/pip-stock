@@ -12,9 +12,8 @@ import pandas_ta as ta
 import plotly.graph_objs as go
 import requests
 from bs4 import BeautifulSoup
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 import hashlib
 import pickle
 import math
@@ -49,7 +48,7 @@ if "logs" not in st.session_state:
     st.session_state["logs"] = []
 
 def append_log(msg):
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     full = f"[{ts} UTC] {msg}"
     st.session_state["logs"].append(full)
     logger.info(full)
@@ -220,7 +219,6 @@ with st.sidebar:
     tickers_input = st.multiselect("Tickers (select)", options=issi_stocks, default=["BRPT.JK","ITMG.JK"])
     mode = st.selectbox("Mode", ["Swing Trading", "Intraday"])
     timeframe_select = st.multiselect("Multi-timeframe", ["1D","4H","1H"], default=["1D"])
-    use_news = st.checkbox("Fetch news (Google News)", value=False)
 
     st.markdown("---")
     st.header("AI Provider & Model Selection (keys hidden)")
@@ -256,7 +254,6 @@ with st.sidebar:
 
 # ---------------- Constants & analyzer ----------------
 INTERVAL_MAP = {"1D":("1y","1d"), "4H":("6mo","4h"), "1H":("3mo","1h")}
-analyzer = SentimentIntensityAnalyzer()
 
 # ---------------- Utility functions ----------------
 def normalize_datetime_column(df):
@@ -387,57 +384,6 @@ def fetch_fundamentals(ticker):
         append_log(f"fetch_fundamentals error for {ticker}: {e}")
         return {}
 
-@st.cache_data(ttl=1800, show_spinner=False)  # cache 30 menit
-def google_news_headlines(query, max_headlines=8):
-    if not query:
-        return []
-    try:
-        q = requests.utils.quote(f"{query} saham OR stock")
-        url = f"https://www.google.com/search?q={q}&tbm=nws"
-        headers = {"User-Agent":"Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
-        articles = soup.select("div.dbsr")
-        headlines = []
-        for a in articles[:max_headlines]:
-            title_tag = a.select_one("div.JheGif.nDgy9d")
-            snippet_tag = a.select_one("div.Y3v8qd")
-            source_tag = a.select_one("div.CEMjEf span")
-            title = title_tag.get_text() if title_tag else None
-            snippet = snippet_tag.get_text() if snippet_tag else ""
-            source = source_tag.get_text() if source_tag else ""
-            if title:
-                headlines.append({"title": title, "snippet": snippet, "source": source})
-        return headlines
-    except Exception as e:
-        append_log(f"google_news_headlines error for {query}: {e}")
-        return []
-
-def compute_news_sentiment_weighted(headlines):
-    if not headlines:
-        return {"score":50,"details":[]}
-    scores = []; details = []
-    for h in headlines:
-        text = (h.get("title","") + " " + h.get("snippet","")).strip()
-        vs = analyzer.polarity_scores(text)
-        weight = 1.0
-        src = (h.get("source") or "").lower()
-        # weight major financial outlets higher; penalize negative heavier (asymmetric impact)
-        if any(x in src for x in ["cnn", "reuters", "bloomberg", "jakarta post", "kompas"]):
-            weight = 1.5
-        if "ihsg" in text.lower() or "ojk" in text.lower() or "rupiah" in text.lower() or "bank indonesia" in text.lower():
-            weight = 2.0
-        # asymmetry: negative headlines have slightly higher impact
-        asym = 1.25 if vs["compound"] < -0.05 else 1.0
-        final_weight = weight * asym
-        compound_weighted = vs["compound"] * final_weight
-        scores.append(compound_weighted)
-        details.append({"text":text,"compound":vs["compound"], "weight":final_weight})
-    avg = np.mean(scores) if scores else 0.0
-    # normalize to 0-100
-    norm = int((avg + 1)/2 * 100)
-    norm = max(0, min(100, norm))
-    return {"score": norm, "details": details}
 
 
 # ---------------- Heuristics & ML helpers (REPLACED BY PRODUCTION MODULES) ----------------
@@ -786,8 +732,6 @@ for ticker in tickers:
             continue
 
         fund = fetch_fundamentals(ticker)
-        headlines = google_news_headlines(ticker) if use_news else []
-        news_sent = compute_news_sentiment_weighted(headlines)
 
         # === ML-Enhanced Trend Strength & Regime ===
         trend_result = calculate_trend_strength_enhanced(df)
@@ -811,12 +755,10 @@ for ticker in tickers:
 
         # === Bayesian Probability (mode-aware horizon)
         rsi = float(df.iloc[-1].get("rsi14", 50))
-        news_score = news_sent.get("score", 50)
         prob_up, prob_details = calculate_bayesian_probability(
             trend_strength=trend_strength,
             trend_direction=trend_direction,
             rsi=rsi,
-            news_score=news_score,
             regime=trend_regime,
             historical_win_rate=0.55 if mode=="Swing Trading" else 0.5,
             prior_p_bullish=0.5 if mode=="Swing Trading" else 0.45
@@ -893,12 +835,6 @@ for ticker in tickers:
                 st.table(pd.DataFrame(list(fund.items()), columns=["metric","value"]).set_index("metric"))
             except Exception as e:
                 st.write("Fundamental fetch error:", e)
-        with st.expander("Headlines"):
-            if headlines:
-                for h in headlines[:8]:
-                    st.write("-", h.get("title"), "|", h.get("source"), "|", h.get("snippet"))
-            else:
-                st.write("No headlines found / disabled")
 
         # Build multi-timeframe feature payload for AI
         def extract_feature_summary(df_local):
@@ -922,11 +858,10 @@ for ticker in tickers:
         payload = {
             "ticker": ticker,
             "timeframe": tf,
-            "date": str(datetime.utcnow().date()),
+            "date": str(datetime.now(UTC).date()),
             "technical": extract_feature_summary(df),
             "multi_timeframe": multi_tf_payload,
             "fundamental": fund,
-            "news_sentiment": news_sent,
             "mtf_score": heuristic_score,
             "mtf_details": mtf_details,
             "bayesian_prob_up": prob_up,
@@ -982,7 +917,7 @@ for ticker in tickers:
                     if ev_metrics.get("expected_value",0) > 0 and prob_up >= 0.6 and rr.get("rr",0) >= 2.0:
                         should_alert = True
                 if should_alert:
-                    msg = f"<b>{ticker} {tf}</b>\nReco: {ai_result.get('rekomendasi') if ai_result else 'EV'}\nProb up: {prob_up*100:.1f}%\nPrice: {last_price}\nEntry: {rr['entry']}\nStop: {rr['stop']}\nTarget: {rr['target']}\nEV: {ev_metrics.get('expected_value',0):.4f}\nPosSize: {shares:.2f}\nTime: {datetime.utcnow().isoformat()} UTC"
+                    msg = f"<b>{ticker} {tf}</b>\nReco: {ai_result.get('rekomendasi') if ai_result else 'EV'}\nProb up: {prob_up*100:.1f}%\nPrice: {last_price}\nEntry: {rr['entry']}\nStop: {rr['stop']}\nTarget: {rr['target']}\nEV: {ev_metrics.get('expected_value',0):.4f}\nPosSize: {shares:.2f}\nTime: {datetime.now(UTC).isoformat()} UTC"
                     sent = send_telegram_alert(telegram_bot_token, telegram_chat_id, msg)
                     if sent:
                         st.success("Telegram alert sent")
