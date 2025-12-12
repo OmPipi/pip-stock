@@ -2,7 +2,6 @@
 # AI Stock Analyzer PRO — Enhanced (prompt, multi-timeframe, SR, VSA, weighted sentiment, EV-based ML)
 # Save and run: streamlit run streamlit_app_pro.py
 
-
 import os
 import streamlit as st
 import pandas as pd
@@ -25,18 +24,6 @@ import traceback
 # ML libs
 from sklearn.metrics import mean_squared_error, r2_score
 import lightgbm as lgb
-
-# === PRODUCTION OPTIMIZATION MODULES ===
-from optimization_module import (
-    calculate_trend_strength_enhanced,
-    calculate_bayesian_probability,
-    identify_sr_levels_professional,
-    analyze_multi_timeframe_confluence,
-    calculate_position_size_dynamic,
-    analyze_vsa_professional,
-    calculate_expected_value
-)
-from risk_management import RiskManager, detect_volatility_regime
 
 # ---------------- Page config ----------------
 st.set_page_config(layout="wide", page_title="AI Stock Analyzer PRO — Enhanced", initial_sidebar_state="expanded")
@@ -439,9 +426,49 @@ def compute_news_sentiment_weighted(headlines):
     norm = max(0, min(100, norm))
     return {"score": norm, "details": details}
 
+# ---------------- Heuristics & ML helpers ----------------
+def simple_scores(df, fund, news_sent):
+    recent = df.iloc[-1]
+    score = 50; reasons=[]
+    price = recent["Close"]
+    if not pd.isna(recent.get("ma50")):
+        score += 8 if price > recent["ma50"] else -8; reasons.append("price vs ma50")
+    if not pd.isna(recent.get("ma200")):
+        score += 10 if price > recent["ma200"] else -10; reasons.append("price vs ma200")
+    rsi = recent.get("rsi14")
+    if not pd.isna(rsi):
+        if rsi < 30: score +=6; reasons.append("RSI oversold")
+        elif rsi > 70: score -=6; reasons.append("RSI overbought")
+    pe = fund.get("trailingPE")
+    if pe and pe>0:
+        if pe<10: score +=6; reasons.append("low PE")
+        elif pe<20: score +=2; reasons.append("moderate PE")
+        else: score -=6; reasons.append("high PE")
+    ns = news_sent.get("score",50)
+    combined = score * 0.8 + ns * 0.2
+    return int(max(0,min(100,round(combined)))), reasons
 
-# ---------------- Heuristics & ML helpers (REPLACED BY PRODUCTION MODULES) ----------------
-# All scoring, probability, S/R, and RR logic now uses optimization_module.py
+def compute_rr_heuristic(df, rr_mult=2, trend_strength=50):
+    last = df.iloc[-1]
+    price = last["Close"]
+    atr = last.get("atr14", np.nan)
+    # dynamic ATR multiplier based on trend_strength
+    if np.isnan(atr) or atr <= 0:
+        atr = price * 0.02
+    if trend_strength >= 65:
+        sl_mult = 1.2
+    elif trend_strength >= 45:
+        sl_mult = 1.5
+    else:
+        sl_mult = 1.8
+    stop = price - sl_mult * atr
+    if stop <= 0 or stop >= price:
+        stop = price * 0.98
+    target = price + rr_mult * (price - stop)
+    reward = target - price
+    risk = price - stop
+    rr_ratio = reward / risk if risk>0 else np.nan
+    return {"entry":round(price,4), "stop":round(stop,4), "target":round(target,4), "rr":round(rr_ratio,3), "atr_mult":sl_mult}
 
 def create_features_for_ml(df):
     dfc = df.copy()
@@ -761,10 +788,6 @@ for ticker in tickers:
             append_log(f"Error fetching {ticker} {tf}: {e}")
             tf_dfs[tf] = pd.DataFrame()
 
-
-    # === Initialize Risk Manager (per session, or per run) ===
-    risk_manager = RiskManager(account_balance=account_balance)
-
     for tf in (timeframe_select or ["1D"]):
         st.subheader(f"Timeframe: {tf}")
         df = tf_dfs.get(tf)
@@ -777,72 +800,47 @@ for ticker in tickers:
         headlines = google_news_headlines(ticker) if use_news else []
         news_sent = compute_news_sentiment_weighted(headlines)
 
-        # === ML-Enhanced Trend Strength & Regime ===
-        trend_result = calculate_trend_strength_enhanced(df)
-        trend_strength = trend_result.strength
-        trend_regime = trend_result.regime
-        trend_direction = trend_result.direction
-        trend_confidence = trend_result.confidence
-        trend_details = trend_result.details
+        try:
+            heuristic_score, reasons = simple_scores(df, fund, news_sent)
+        except Exception as e:
+            append_log(f"[{ticker} {tf}] simple_scores error: {e}")
+            heuristic_score, reasons = 50, ["error computing heuristic"]
 
-        # === Professional S/R Levels ===
-        sr_levels = identify_sr_levels_professional(df)
-        supports = [s[0] for s in sr_levels.supports]
-        resistances = [r[0] for r in sr_levels.resistances]
-
-        # === Professional VSA ===
-        vsa = analyze_vsa_professional(df)
-        df["vsa_signal"] = vsa["signal"]
-
-        # === Multi-timeframe confluence ===
-        mtf_score, mtf_details = analyze_multi_timeframe_confluence(tf_dfs)
-
-        # === Bayesian Probability ===
-        rsi = float(df.iloc[-1].get("rsi14", 50))
-        news_score = news_sent.get("score", 50)
-        prob_up, prob_details = calculate_bayesian_probability(
-            trend_strength=trend_strength,
-            trend_direction=trend_direction,
-            rsi=rsi,
-            news_score=news_score,
-            regime=trend_regime
+        # compute SR pivots and VSA
+        supports, resistances = compute_sr_pivots(df)
+        df["vsa_signal"] = np.where(
+            (df["Close"] > df["Open"]) & (df["Volume"] > df["vol20"]), "accumulation",
+            np.where((df["Close"] < df["Open"]) & (df["Volume"] > df["vol20"]), "distribution", "neutral")
         )
 
-        # === Dynamic Position Sizing ===
-        last = df.iloc[-1]
-        price = float(last["Close"])
-        atr = float(last.get("atr14", price * 0.02))
-        stop_loss = price - atr * 1.5
-        target = price + atr * 2.5
-        volatility_regime = detect_volatility_regime(atr, df["atr14"].rolling(20).mean().iloc[-1] if "atr14" in df.columns else None, price)
-        shares, sizing_details = risk_manager.calculate_position_size(
-            entry_price=price,
-            stop_loss=stop_loss,
-            volatility_atr=atr,
-            trend_strength=trend_strength,
-            volatility_regime=volatility_regime
-        )
+        # Multi-timeframe summary: compute simple trend_strength
+        trend_strength = 50
+        # heavier weight to higher timeframe
+        tf_weights = {"1D":0.5, "4H":0.3, "1H":0.2}
+        trend_score_acc = 0.0
+        weight_sum = 0.0
+        for tff, df_t in tf_dfs.items():
+            if df_t is None or df_t.empty:
+                continue
+            recent = df_t.iloc[-1]
+            score_local = 50
+            # price vs ma50/ma200 signals
+            if not pd.isna(recent.get("ma50")):
+                score_local += 20 if recent["Close"] > recent["ma50"] else -20
+            if not pd.isna(recent.get("ma200")):
+                score_local += 20 if recent["Close"] > recent["ma200"] else -20
+            # rsi momentum
+            rsi = recent.get("rsi14")
+            if not pd.isna(rsi):
+                if rsi < 30: score_local += 10
+                elif rsi > 70: score_local -= 10
+            w = tf_weights.get(tff, 0.0)
+            trend_score_acc += score_local * w
+            weight_sum += w
+        if weight_sum > 0:
+            trend_strength = int(max(0,min(100, round(trend_score_acc / weight_sum))))
 
-        # === Expected Value Calculation ===
-        ev_metrics = calculate_expected_value(
-            entry_price=price,
-            stop_loss=stop_loss,
-            target_price=target,
-            probability_up=prob_up,
-            risk_per_trade=sizing_details.get("risk_per_trade", account_balance * risk_pct / 100)
-        )
-
-        # === Compose reasons for UI ===
-        reasons = [
-            f"Trend: {trend_direction} (strength={trend_strength}, regime={trend_regime.value})",
-            f"Multi-TF confluence: {mtf_details['direction']} (score={mtf_score})",
-            f"Bayesian prob_up: {prob_up:.2f}",
-            f"VSA: {vsa['signal']} (strength={vsa['strength']:.2f})",
-            f"Position size: {shares:.2f} shares (risk {sizing_details.get('risk_per_trade',0):,.0f})"
-        ]
-
-        heuristic_score = mtf_score
-        rr = {"entry": price, "stop": stop_loss, "target": target, "rr": (target - price) / (price - stop_loss) if (price - stop_loss) > 0 else np.nan}
+        rr = compute_rr_heuristic(df, rr_mult=2, trend_strength=trend_strength)
 
         # Chart
         try:
@@ -864,14 +862,12 @@ for ticker in tickers:
             append_log(f"[{ticker} {tf}] Chart render error: {e}")
             st.error(f"Chart render error: {e}")
 
-
         last_price = float(df.iloc[-1]["Close"])
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("MTF Score", heuristic_score)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Heuristic score", heuristic_score)
         c2.metric("Last close", f"{last_price:,.2f}")
-        c3.metric("Bayes Prob Up", f"{prob_up*100:.1f}%")
-        c4.metric("R:R", rr.get("rr"))
-        c5.metric("Pos. Size", f"{shares:.2f}")
+        c3.metric("Heuristic R:R", rr.get("rr"))
+        c4.metric("News score", news_sent.get("score",50))
 
         with st.expander("Fundamental snapshot"):
             try:
@@ -903,7 +899,6 @@ for ticker in tickers:
 
         multi_tf_payload = {k: extract_feature_summary(v) for k,v in tf_dfs.items()}
 
-
         payload = {
             "ticker": ticker,
             "timeframe": tf,
@@ -912,22 +907,22 @@ for ticker in tickers:
             "multi_timeframe": multi_tf_payload,
             "fundamental": fund,
             "news_sentiment": news_sent,
-            "mtf_score": heuristic_score,
-            "mtf_details": mtf_details,
-            "bayesian_prob_up": prob_up,
-            "bayesian_details": prob_details,
-            "ev_metrics": ev_metrics,
-            "position_size": shares,
-            "position_sizing_details": sizing_details,
-            "sr_levels": {"supports": supports, "resistances": resistances},
-            "trend_strength": trend_strength,
-            "trend_regime": trend_regime.value,
-            "trend_direction": trend_direction,
-            "trend_confidence": trend_confidence,
-            "vsa": vsa,
-            "reasons": reasons
+            "heuristic_score": heuristic_score,
+            "heuristic_reasons": reasons,
+            "heuristic_rr": rr,
+            "support_levels": supports,
+            "resistance_levels": resistances,
+            "trend_strength": trend_strength
         }
 
+        # Expected value calculation with a simple heuristic pre-AI (for AI and telegram)
+        # If AI not available, use heuristic EV as fallback
+        # estimate prob_up from heuristic_score & news
+        prob_up_est = min(0.9, max(0.05, 0.5 + (heuristic_score - 50)/200 + (news_sent.get("score",50)-50)/200))
+        reward = rr["target"] - rr["entry"]
+        risk = rr["entry"] - rr["stop"]
+        ev = prob_up_est * reward - (1-prob_up_est) * risk if (reward is not None and risk is not None) else 0.0
+        payload["heuristic_ev"] = {"prob_up_est":prob_up_est, "ev":ev}
 
         # Call AI wrapper
         try:
@@ -946,7 +941,6 @@ for ticker in tickers:
                 st.write("AI output (raw):", str(ai_result)[:1000])
 
         # Telegram alerts
-
         try:
             if enable_telegram and telegram_bot_token and telegram_chat_id:
                 should_alert = False
@@ -954,20 +948,21 @@ for ticker in tickers:
                 if ai_result:
                     reco = (ai_result.get("rekomendasi","") or "").upper()
                     prob_map = ai_result.get("probabilitas",{}) or {}
-                    prob_up_ai = prob_map.get("naik_5d") or prob_map.get("naik_3d")
+                    prob_up = prob_map.get("naik_5d") or prob_map.get("naik_3d")
                     rr_ratio = (ai_result.get("risk_reward") or {}).get("rr_ratio") or rr.get("rr")
                     if reco == "BUY":
                         should_alert = True
-                    elif prob_up_ai is not None and isinstance(prob_up_ai, (int,float)) and prob_up_ai >= 0.6:
+                    elif prob_up is not None and isinstance(prob_up, (int,float)) and prob_up >= 0.6:
                         should_alert = True
-                    elif rr_ratio and rr_ratio >= 2.0 and prob_up_ai is not None and prob_up_ai >= 0.55:
+                    elif rr_ratio and rr_ratio >= 2.0 and prob_up is not None and prob_up >= 0.55:
                         should_alert = True
                 else:
-                    # fallback to EV metrics
-                    if ev_metrics.get("expected_value",0) > 0 and prob_up >= 0.6 and rr.get("rr",0) >= 2.0:
+                    # fallback to heuristic EV
+                    if ev is not None and ev > 0 and prob_up_est >= 0.6 and rr.get("rr",0) >= 2.0:
                         should_alert = True
                 if should_alert:
-                    msg = f"<b>{ticker} {tf}</b>\nReco: {ai_result.get('rekomendasi') if ai_result else 'EV'}\nProb up: {prob_up*100:.1f}%\nPrice: {last_price}\nEntry: {rr['entry']}\nStop: {rr['stop']}\nTarget: {rr['target']}\nEV: {ev_metrics.get('expected_value',0):.4f}\nPosSize: {shares:.2f}\nTime: {datetime.utcnow().isoformat()} UTC"
+                    # prepare message
+                    msg = f"<b>{ticker} {tf}</b>\nReco: {ai_result.get('rekomendasi') if ai_result else 'HEURISTIC'}\nProb up est: {round(prob_up_est*100,1)}%\nPrice: {last_price}\nEntry: {rr['entry']}\nStop: {rr['stop']}\nTarget: {rr['target']}\nEV: {ev:.4f}\nTime: {datetime.utcnow().isoformat()} UTC"
                     sent = send_telegram_alert(telegram_bot_token, telegram_chat_id, msg)
                     if sent:
                         st.success("Telegram alert sent")
@@ -996,21 +991,12 @@ for ticker in tickers:
                 append_log(f"[{ticker} {tf}] Backtest error: {e}\n{traceback.format_exc()}")
                 st.error(f"Backtest error: {e}")
 
-
         per_ticker_result["timeframes"][tf] = {
-            "mtf_score": heuristic_score,
+            "heuristic_score": heuristic_score,
             "ai_result": ai_result,
             "ai_err": ai_err,
             "rr": rr,
-            "ev_metrics": ev_metrics,
-            "bayesian_prob_up": prob_up,
-            "position_size": shares,
-            "trend_strength": trend_strength,
-            "trend_regime": trend_regime.value,
-            "trend_direction": trend_direction,
-            "vsa": vsa,
-            "sr_levels": {"supports": supports, "resistances": resistances},
-            "reasons": reasons
+            "heuristic_ev": {"prob_up_est":prob_up_est, "ev":ev}
         }
 
         time.sleep(0.25)
