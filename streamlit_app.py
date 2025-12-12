@@ -214,11 +214,17 @@ issi_stocks = [
 	"ZONE.JK", "ZYRX.JK"
 ]
 
+
 with st.sidebar:
     st.header("Global settings")
     tickers_input = st.multiselect("Tickers (select)", options=issi_stocks, default=["BRPT.JK","ITMG.JK"])
     mode = st.selectbox("Mode", ["Swing Trading", "Intraday"])
     timeframe_select = st.multiselect("Multi-timeframe", ["1D","4H","1H"], default=["1D"])
+    entry_strategy = st.selectbox(
+        "Entry strategy",
+        ["Buy on Support", "Breakout", "Retracement"],
+        help="Pilih strategi entry: Buy on Support (beli di support terdekat), Breakout (beli di atas resistance), Retracement (beli di antara support dan harga sekarang, misal 50% retrace)"
+    )
 
     st.markdown("---")
     st.header("AI Provider & Model Selection (keys hidden)")
@@ -765,14 +771,31 @@ for ticker in tickers:
         )
 
         # === Dynamic Position Sizing (mode-aware ATR multipliers)
+
         last = df.iloc[-1]
-        price = float(last["Close"])
-        atr = float(last.get("atr14", price * 0.02))
-        stop_loss = price - atr * atr_mult_stop
-        target = price + atr * atr_mult_target
-        volatility_regime = detect_volatility_regime(atr, df["atr14"].rolling(20).mean().iloc[-1] if "atr14" in df.columns else None, price)
+        last_close = float(last["Close"])
+        atr = float(last.get("atr14", last_close * 0.02))
+
+        # --- Entry price logic by strategy ---
+        entry_price = last_close
+        entry_note = "Last close"
+        if entry_strategy == "Buy on Support" and supports:
+            entry_price = supports[-1]  # nearest support (lowest)
+            entry_note = f"Nearest support ({entry_price:.2f})"
+        elif entry_strategy == "Breakout" and resistances:
+            entry_price = resistances[0] + atr * 0.1  # just above nearest resistance
+            entry_note = f"Breakout above resistance ({entry_price:.2f})"
+        elif entry_strategy == "Retracement" and supports:
+            # 50% retracement between support and last close
+            retrace = supports[-1] + 0.5 * (last_close - supports[-1])
+            entry_price = retrace
+            entry_note = f"50% retracement ({entry_price:.2f})"
+
+        stop_loss = entry_price - atr * atr_mult_stop
+        target = entry_price + atr * atr_mult_target
+        volatility_regime = detect_volatility_regime(atr, df["atr14"].rolling(20).mean().iloc[-1] if "atr14" in df.columns else None, entry_price)
         shares, sizing_details = risk_manager.calculate_position_size(
-            entry_price=price,
+            entry_price=entry_price,
             stop_loss=stop_loss,
             volatility_atr=atr,
             trend_strength=trend_strength,
@@ -781,7 +804,7 @@ for ticker in tickers:
 
         # === Expected Value Calculation ===
         ev_metrics = calculate_expected_value(
-            entry_price=price,
+            entry_price=entry_price,
             stop_loss=stop_loss,
             target_price=target,
             probability_up=prob_up,
@@ -794,12 +817,13 @@ for ticker in tickers:
             f"Multi-TF confluence: {mtf_details['direction']} (score={mtf_score})",
             f"Bayesian prob_up: {prob_up:.2f}",
             f"VSA: {vsa['signal']} (strength={vsa['strength']:.2f})",
+            f"Entry strategy: {entry_strategy} — {entry_note}",
             f"Position size: {shares:.2f} shares (risk {sizing_details.get('risk_per_trade',0):,.0f})",
             f"Mode: {mode} | ATR stop x{atr_mult_stop} | Target x{atr_mult_target} | Prob horizon {prob_horizon}d"
         ]
 
         heuristic_score = mtf_score
-        rr = {"entry": price, "stop": stop_loss, "target": target, "rr": (target - price) / (price - stop_loss) if (price - stop_loss) > 0 else np.nan}
+        rr = {"entry": entry_price, "stop": stop_loss, "target": target, "rr": (target - entry_price) / (entry_price - stop_loss) if (entry_price - stop_loss) > 0 else np.nan}
 
         # Chart
         try:
@@ -823,12 +847,13 @@ for ticker in tickers:
 
 
         last_price = float(df.iloc[-1]["Close"])
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("MTF Score", heuristic_score)
         c2.metric("Last close", f"{last_price:,.2f}")
-        c3.metric("Bayes Prob Up", f"{prob_up*100:.1f}%")
-        c4.metric("R:R", rr.get("rr"))
-        c5.metric("Pos. Size", f"{shares:.2f}")
+        c3.metric("Entry", f"{entry_price:,.2f}")
+        c4.metric("Bayes Prob Up", f"{prob_up*100:.1f}%")
+        c5.metric("R:R", rr.get("rr"))
+        c6.metric("Pos. Size", f"{shares:.2f}")
 
         with st.expander("Fundamental snapshot"):
             try:
@@ -875,6 +900,8 @@ for ticker in tickers:
             "trend_direction": trend_direction,
             "trend_confidence": trend_confidence,
             "vsa": vsa,
+            "entry_strategy": entry_strategy,
+            "entry_note": entry_note,
             "reasons": reasons
         }
 
@@ -892,6 +919,8 @@ for ticker in tickers:
             st.subheader("AI analysis")
             try:
                 render_ai_result(ai_result)
+                st.subheader("Payload Raw")
+                st.json(payload)
             except Exception:
                 st.write("AI output (raw):", str(ai_result)[:1000])
 
